@@ -16,6 +16,11 @@
   `[lower−e, upper+e]`（基准点固定为 0、不参与放宽），求让整条尺寸链恢复可行的
   **最小非负整数 e**，并返回 e、同一组满足放宽后全部约束的整数坐标及逐条约束的
   原区间与放宽后区间（原请求可行时 e=0）；
+  `/shims` 在尺寸链可行时，计算指定**起点→终点**在全部约束共同成立下
+  “终点坐标 − 起点坐标”的**可达整数微米紧区间**，从提交的非负整数
+  **标准厚度列表**中筛出区间内规格，按与**目标厚度**的绝对差最小（并列取厚度
+  较小）选一项，并返回满足所选厚度与全部原约束的**同一组整数坐标**
+  （区间内无规格时所选项与坐标均为 `null`）；
 - **有负环（不可行）**：沿负环累加得到 `0 ≤ 负数` 的矛盾，返回构成该矛盾
   闭环的**原始约束编号**及逐边明细，便于定位尺寸链中的过约束环节。
 
@@ -37,6 +42,7 @@ docker compose up --build -d
 | 冗余约束识别接口 | `POST http://localhost:8000/api/v1/chains/redundancy` |
 | 读数最小校正接口 | `POST http://localhost:8000/api/v1/chains/reconcile` |
 | 统一放宽求最小 e 接口 | `POST http://localhost:8000/api/v1/chains/relax` |
+| 垫片选配接口 | `POST http://localhost:8000/api/v1/chains/shims` |
 | Swagger UI（在线试调） | <http://localhost:8000/docs> |
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
@@ -89,6 +95,11 @@ curl -s -X POST http://localhost:8000/api/v1/chains/relax \
   -H 'Content-Type: application/json' \
   -d @examples/relax.json | python -m json.tool
 
+# 可行：给起点/终点、非负整数标准厚度表与目标厚度，返回可达紧区间、最贴近目标的规格及同一组坐标
+curl -s -X POST http://localhost:8000/api/v1/chains/shims \
+  -H 'Content-Type: application/json' \
+  -d @examples/shims.json | python -m json.tool
+
 # 不可行：返回矛盾闭环的约束编号
 curl -s -X POST http://localhost:8000/api/v1/chains/check \
   -H 'Content-Type: application/json' \
@@ -104,7 +115,9 @@ curl -s -X POST http://localhost:8000/api/v1/chains/check \
 
 `/api/v1/chains/check`、`/api/v1/chains/ranges`、`/api/v1/chains/redundancy`
 与 `/api/v1/chains/relax` 的请求体、静态校验规则（含下文 422 错误码）完全一致；
-`/reconcile` 在其基础上**额外要求** `readings` 字段，其余字段与校验规则沿用。
+`/reconcile` 在其基础上**额外要求** `readings` 字段，`/shims` 在其基础上**额外
+要求** `start` / `end` / `standard_thicknesses` / `target_thickness` 四个字段，
+二者其余字段与校验规则均沿用。
 
 ### 请求体 `POST /api/v1/chains/check`（`/ranges`、`/redundancy`、`/relax` 同）
 
@@ -375,6 +388,88 @@ c1/c2 则 B、C 各为 `[0,10]`，但 c3 要求 `C − B = 5`，跨测点约束�
 0 的固定关系（含自环式的基准点矛盾）不被放宽。`start == end` 且原区间不含 0 的
 自环矛盾同样按 `e ≥ −min(upper, −lower)` 解除。
 
+### `POST /api/v1/chains/shims`：垫片选配
+
+请求体在 `/check` 的三个字段外，**增加四个字段**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `start` | string | 垫片尺寸的**起点**编号，必须已在基准点或测点中声明 |
+| `end` | string | 垫片尺寸的**终点**编号，必须已在基准点或测点中声明；允许与起点相同（差值恒为 0） |
+| `standard_thicknesses` | **非负整数** µm[] | 可选配的标准厚度列表，允许 `0`、允许重复、允许为空（空列表时所选项与坐标均为 `null`） |
+| `target_thickness` | **非负整数** µm | 目标厚度：先按 `|规格 − target_thickness|` 最小、并列按规格较小选一项 |
+
+厚度与目标厚度给负数或小数均按 422 拦截；`start`/`end` 未声明时返回
+`unknown_point`（`location` 分别为 `["start"]`、`["end"]`）。原尺寸链的全部
+静态校验（未知点、反向区间、未连通等）同样沿用。
+
+服务端先校核原尺寸约束：**原约束本身无解时**（负环），返回与 `/check`
+**完全相同的 `InfeasibleResponse`**（矛盾闭环编号、逐边明细、环权）。
+原约束有解时，先求
+`t = coord(终点) − coord(起点)` 在**全部约束共同成立**（含基准点固定为 0）
+下的**可达整数紧区间 `[minimum, maximum]`**（端点各自可由某组全局可行坐标达到，
+区间可为负数、可退化为单点）；再从 `standard_thicknesses` 中筛出
+`minimum ≤ t ≤ maximum` 的规格，按 **`|t − target_thickness|` 最小**、
+并列时 **t 较小**确定唯一选项，并返回满足原约束且差值**恰好**等于该规格的
+**同一组整数坐标**。区间内无规格（含列表为空，或紧区间整体为负）时
+`selected_thickness` 与 `coordinates` 均为 `null`，紧区间照常返回。
+
+请求（`examples/shims.json`）：
+
+```json
+{
+  "datum_points": ["A"],
+  "measure_points": ["B", "C"],
+  "constraints": [
+    {"id": "c1", "start": "A", "end": "B", "lower": 10, "upper": 12},
+    {"id": "c2", "start": "B", "end": "C", "lower": 5, "upper": 8}
+  ],
+  "start": "A",
+  "end": "C",
+  "standard_thicknesses": [0, 5, 10, 15, 18, 20, 22, 25],
+  "target_thickness": 19
+}
+```
+
+响应（HTTP 200，有合适规格）：
+
+```json
+{
+  "status": "feasible",
+  "unit": "um",
+  "interval": {"start": "A", "end": "C", "minimum": 15, "maximum": 20},
+  "target_thickness": 19,
+  "selected_thickness": 18,
+  "coordinates": {"A": 0, "B": 12, "C": 18}
+}
+```
+
+上例 `C − A` 的可达区间为 `[15, 20]`（c1+c2 各取下/上限），区间内规格为
+`15/18/20`；目标厚度 19 下 18 与 20 的绝对差同为 1，**并列取较薄的 18**。
+返回坐标 `B=12、C=18` 同时满足 c1（`12−0=12 ∈ [10,12]`）、c2
+（`18−12=6 ∈ [5,8]`）与所选厚度（`18−0=18`）。
+
+区间内无规格时（如 `examples/shims_none.json`，厚度表只有 `0/5/10/22/25`）：
+
+```json
+{
+  "status": "feasible",
+  "unit": "um",
+  "interval": {"start": "A", "end": "C", "minimum": 15, "maximum": 20},
+  "target_thickness": 18,
+  "selected_thickness": null,
+  "coordinates": null
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `interval.start` / `end` | 与请求一致的起点 / 终点编号 |
+| `interval.minimum` / `maximum` | `coord(终点) − coord(起点)` 的可达整数紧区间端点（µm，含端点，可为负数） |
+| `target_thickness` | 回显请求的目标厚度（非负整数 µm） |
+| `selected_thickness` | 选中的一项标准厚度（整数 µm）；区间内无规格时为 `null` |
+| `coordinates` | 满足所选厚度与全部原约束的**同一组**整数坐标（基准点为 0）；无合适规格时为 `null` |
+
 ### 响应二：不可行（HTTP 200）
 
 ```json
@@ -428,6 +523,10 @@ c1/c2 则 B、C 各为 `[0,10]`，但 c3 要求 `C − B = 5`，跨测点约束�
 | `point_role_conflict` | 同一点同时出现在基准点和测点中 |
 | `reading_missing` | （仅 `/reconcile`）某测点在 `readings` 中缺少读数，未恰好覆盖全部测点 |
 | `reading_extra` | （仅 `/reconcile`）`readings` 含基准点或未在 `measure_points` 中声明的额外测点 |
+
+`/shims` 的 `start` / `end` 未声明时同样使用 `unknown_point` 代码
+（`location` 为 `["start"]` / `["end"]`）；标准厚度或目标厚度为负数、小数
+等由 Pydantic 在字段层拦截（HTTP 422）。
 
 此外，字段缺失、类型错误（如公差或读数给了小数 `1.5`、布尔值）、多余字段等由
 Pydantic 拦截，同样返回 HTTP 422。
@@ -490,6 +589,16 @@ Bellman–Ford）。预计算这三个量（三次 O(|V|·|E|) 松弛，与 `/ra
 `e*` 下从 anchor 的最短距离即一组满足放宽后全部约束的整数坐标
 （全部基准点为 0）；原请求可行时第一步 e=0 即通过，直接返回与 `/check`
 相同的坐标。
+
+`/shims` 的可达紧区间直接由最短路给出（与 `/ranges` 的单侧推导同族）：
+沿任意起点→终点路径累加都有
+`coord(终点) − coord(起点) ≤ 路径权和`，故**最大可达差值** = 起点→终点的
+最短距离，**最小可达差值** = 终点→起点最短距离的相反数；两次 SPFA 即可，
+整数边权保证端点为整数微米，全图强连通保证两个距离均有限。区间内的每个整数
+`t` 都可实现：并入 `起点→终点`（权 t）与 `终点→起点`（权 −t）两条精确差值
+边后图仍无负环（t 在界内时并入的任意环权均不减为负），从 anchor 跑一次
+Bellman–Ford 得到的最短距离就是满足全部原约束且差值恰为 t 的同一组整数坐标。
+规格筛选是在该区间上的纯整数比较：`min t: (|t − target_thickness|, t)`。
 
 ## 项目结构
 

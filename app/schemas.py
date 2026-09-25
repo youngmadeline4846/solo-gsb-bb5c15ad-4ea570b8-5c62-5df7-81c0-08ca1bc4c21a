@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 # 允许的点编号：非空字符串（允许前后空白，入库时自动去除）
 PointId = str
+
+# 非负整数微米：垫片厚度、目标厚度等物理量不允许负值
+NonNegativeUm = Annotated[StrictInt, Field(ge=0)]
 
 
 def _strip(name: str, value: object) -> str:
@@ -101,6 +104,37 @@ class ReconcileRequest(ChainRequest):
                 )
             stripped[name] = value
         return stripped
+
+
+class ShimRequest(ChainRequest):
+    """垫片选配请求：沿用尺寸链校核请求，另收起终点、标准厚度表与目标厚度。
+
+    在全部尺寸约束（含基准点固定为 0）同时成立的前提下，求
+    ``coord(终点) − coord(起点)`` 可取的整数微米**紧区间**；
+    ``standard_thicknesses`` 为可选配的非负整数标准厚度（允许 0，允许重复，
+    顺序不影响结果），从中筛出落在该紧区间内的规格，优先取与
+    ``target_thickness``（非负整数）绝对差最小者，并列时取厚度较小者。
+    """
+
+    start: PointId = Field(..., description="垫片尺寸的起点编号（须已在基准点或测点中声明）")
+    end: PointId = Field(..., description="垫片尺寸的终点编号（须已在基准点或测点中声明，可与起点相同）")
+    standard_thicknesses: list[NonNegativeUm] = Field(
+        ...,
+        max_length=10000,
+        description=(
+            "可选配的标准厚度列表（非负整数微米，含 0；允许重复，列表为空时"
+            "所选项与坐标均为 null）"
+        ),
+    )
+    target_thickness: NonNegativeUm = Field(
+        ...,
+        description="目标厚度（非负整数微米）：先按与其绝对差最小、再按厚度较小选规格",
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _strip_endpoint_fields(cls, v: str) -> str:
+        return _strip("起点 / 终点编号", v)
 
 
 class CycleEdge(BaseModel):
@@ -282,6 +316,52 @@ class RelaxResponse(BaseModel):
     )
     constraints: list[RelaxedConstraint] = Field(
         ..., description="逐条约束的原区间与放宽后区间，按请求 constraints 的顺序列出"
+    )
+
+
+class ShimInterval(BaseModel):
+    """终点−起点在全部约束同时成立下可取的整数微米紧区间（端点均可由某组全局可行坐标达到）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start: PointId = Field(..., description="起点编号（与请求 start 一致）")
+    end: PointId = Field(..., description="终点编号（与请求 end 一致）")
+    minimum: StrictInt = Field(
+        ..., description="可达最小整数厚度（微米，含端点），可为负数"
+    )
+    maximum: StrictInt = Field(
+        ..., description="可达最大整数厚度（微米，含端点），可为负数"
+    )
+
+
+class ShimResponse(BaseModel):
+    """垫片选配响应：可达紧区间、选中的标准厚度及满足该厚度与全部原约束的同一组坐标。"""
+
+    status: Literal["feasible"] = "feasible"
+    unit: Literal["um"] = "um"
+    interval: ShimInterval = Field(
+        ...,
+        description=(
+            "全部约束（含基准点固定为 0）共同成立时 coord(终点) − coord(起点) "
+            "的可达整数紧区间"
+        ),
+    )
+    target_thickness: NonNegativeUm = Field(
+        ..., description="请求给出的目标厚度（非负整数微米）"
+    )
+    selected_thickness: StrictInt | None = Field(
+        ...,
+        description=(
+            "区间内按 |厚度 − target_thickness| 最小（并列取厚度较小）选出的一项"
+            "标准厚度；区间内无规格时为 null"
+        ),
+    )
+    coordinates: dict[PointId, StrictInt] | None = Field(
+        ...,
+        description=(
+            "满足所选厚度（终点−起点恰好等于 selected_thickness）及全部原约束的"
+            "同一组整数坐标（微米，基准点为 0）；无合适规格时为 null"
+        ),
     )
 
 
