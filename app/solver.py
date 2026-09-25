@@ -1,0 +1,758 @@
+"""差分约束求解：Bellman-Ford 负环检测、坐标紧界推导与删边最短路冗余判定。
+
+建模
+----
+每条原始约束 ``c: coord(end) - coord(start) ∈ [lower, upper]``
+（单位：整数微米）转成两条差分不等式：
+
+* ``coord(end)   - coord(start) ≤ upper``  → 边 start→end，权 upper（上限边）
+* ``coord(start) - coord(end)   ≤ -lower`` → 边 end→start，权 -lower（下限反向边）
+
+基准点坐标恒为 0。取第一个基准点 ``anchor`` 作参考点（距离初始化为 0），
+其余基准点与 anchor 之间各加两条权为 0 的 ``datum_pin`` 边，表示
+``coord(di) = coord(anchor) = 0``。
+
+在差分图上跑 Bellman-Ford：
+不存在负环 ⇔ 所有不等式可同时满足 ⇔ 公差可行；
+存在负环时，环上边权之和严格为负，沿环累加得到 0 < 负数的矛盾，
+环中除 ``datum_pin`` 外的边所对应的原始约束编号即构成矛盾闭环。
+
+可行时的逐点紧界（``solve_ranges``）
+------------------------------------
+在 ``x_v - x_u ≤ w(u→v)`` 的差分图中，沿任意 anchor→v 路径累加都有
+``x_v ≤ 路径权和``，故 ``max x_v`` 等于 **原图 anchor→v 的最短距离**；
+取各点最短距离赋值本身满足全部不等式，因此该上界可由一组全局可行坐标达到。
+
+同理 ``min x_v`` 等于 **转置图（全部边反向、权不变）anchor→v 最短距离
+的相反数**（即原图 v→anchor 的最短距离取负），其极值赋值同样可行。
+跨测点约束、多个基准点互钉为 0 的 pin 边、负权边均已在图中，故这是
+纳入全部固定关系后的全局紧界；各测点的端点不必由同一组坐标同时达到。
+整数权 ⇒ 最短路距离为整数，紧界本身即整数微米坐标。
+
+冗余判定（``solve_redundancy``）
+--------------------------------
+对每条约束 ``c: coord(end) − coord(start) ∈ [lower, upper]``，在**删去其
+上下界两条差分边**后的图上（其余约束与基准点 pin 边全部保留，待判约束
+本身不参与推导）重新求最短路：
+
+* 推导上界 = 删边图中 ``start → end`` 的最短距离（不可达则上无界，记 None）；
+* 推导下界 = 删边图中 ``end → start`` 的最短距离取负（不可达则下无界）。
+
+最短路即最紧界：距离赋值 ``x_v = d(start, v)``（再整体平移使基准点为 0）
+本身就达到该差值，论证同 ``solve_ranges``。仅当两侧均有界且推导区间
+完全落入原区间 ``[lower, upper]``（``derived_lower ≥ lower`` 且
+``derived_upper ≤ upper``）时，该约束才被其余条件蕴含（冗余）。
+原系统可行 ⇒ 删边子图仍无负环，最短路必存在（或不可达）。
+
+实现先用队列松弛（SPFA）求全源最短距离：边 ``u→v`` 权 ``w`` 若满足
+``d(u,v) < w``（“松边”），则它不可能出现在任何最短 u→v 路径上（最短路径
+可取 simple path，其上该边只能是 u→v 的整段单条边），删边距离就是
+``d(u,v)``；只有 ``d(u,v) == w`` 的“紧边”才需在删边图上重算。通常紧边
+很少（零宽链这类极端情形除外），故远快于每约束两次完整 Bellman–Ford。
+
+读数校正（``solve_reconcile``）
+-------------------------------
+每个测点 p 另给整数微米读数 r_p，要求校正坐标 x_p 满足
+``|x_p − r_p| ≤ e``（e 为非负整数）。改写为两条差分不等式：
+
+* ``x_p ≤ r_p + e`` → anchor→p 边，权 ``r_p + e``
+* ``-x_p ≤ -r_p + e`` → p→anchor 边，权 ``-r_p + e``
+
+即把每个测点“钉”到以读数为中心、半宽 e 的整数区间，与原尺寸约束合并为
+同一张差分图，仍以无负环作为可行性判据。可行性对 e **单调**：e 可行则
+更大的 e 必可行（可行域只扩不缩），且原约束系统可行时存在有限上界（原图
+anchor→p 的最短距离给出一组可行坐标，取到读数的最大偏差即上界），故在
+``[0, hi]`` 上二分即可找到全局最小非负整数 e。
+
+读数边均以 anchor 为端点，并入后的任何负环都可归约为三类含读数边的简单环
+（路径中段不经过 anchor；经过 anchor 的走法拆成这些简单环），其权只通过
+``f(v)``（原图 anchor→v 最短路）、``g(v)``（原图 v→anchor 最短路）与
+``h(v)``（去掉 anchor 的子图中 min_p(r_p + δ(p→v))）三个与 e 无关的量
+依赖 e。三次 Bellman–Ford 预计算后，二分中每个 e 的可行性判定只需
+O(|V|) 次比较；e* 下的最短距离
+``d*(v) = min(f(v), h(v) + e*)`` 即达到 e* 的同一组整数可行校正坐标
+（anchor 及与它 0 权互钉的基准点为 0）。
+
+统一放宽（``solve_relax``）
+---------------------------
+每条约束统一放宽为
+``coord(end) − coord(start) ∈ [lower−e, upper+e]``，对应两条差分边权各加 e
+（``upper+e`` 与 ``−lower+e``）；**基准点 pin 边权恒为 0，不参与放宽**。
+于是任意含 k 条约束边的有向闭环 C 的环权为 ``W(C) + k·e``（pin 边贡献 0），
+系统可行 ⇔ 所有闭环 ``W(C) + k·e ≥ 0`` ⇔
+``e ≥ max_C ⌈−W(C)/k⌉``。该最大值必须覆盖图中**所有**冲突环——
+Bellman–Ford 一次只还原一个负环，仅按首个矛盾闭环估 e 会漏掉其余环上
+更大的要求。可行性对 e 单调（e 增大只放松约束），二分中每次用 SPFA
+负环检测做**全局**判定，自动覆盖全部闭环；当 e 大到所有约束边权非负
+（pin 边本就为 0）时图中必无负环，给出有限二分上界
+``hi = max(0, −min 约束边权)``。e* 下从 anchor 的最短距离即一组满足放宽后
+全部约束的整数坐标（基准点为 0）；原系统可行时 e=0，坐标与 ``solve`` 一致。
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+
+from .schemas import ChainRequest, ConstraintIn, ReconcileRequest
+
+INF: int = 10**30
+
+
+class ValidationError(Exception):
+    """请求在求解前的静态校验错误（未知点 / 反向区间 / 未连通等）。"""
+
+    def __init__(self, errors: list[dict]) -> None:
+        self.errors = errors
+        super().__init__(f"{len(errors)} 个校验错误")
+
+
+@dataclass(frozen=True)
+class Edge:
+    fr: str  # 差分图边起点
+    to: str  # 差分图边终点
+    weight: int
+    cid: str | None  # 原始约束编号；基准点固定边为 None
+    bound: str  # "upper" | "lower" | "datum_pin"
+    start: str | None  # 原始约束起点（pin 边为 None）
+    end: str | None  # 原始约束终点（pin 边为 None）
+
+
+@dataclass(frozen=True)
+class RedundancyItem:
+    """单条约束的冗余判定结果（推导界为 None 表示该侧无界）。"""
+
+    cid: str
+    lower: int | None  # 其余条件对 coord(end)−coord(start) 推出的最紧下界
+    upper: int | None  # 其余条件对 coord(end)−coord(start) 推出的最紧上界
+    redundant: bool
+
+
+@dataclass
+class SolveResult:
+    feasible: bool
+    coordinates: dict[str, int]
+    # 不可行时：按有向环顺序排列的边（含 datum_pin 边以便审计）
+    cycle_edges: list[Edge]
+    cycle_weight: int
+    # solve_ranges 可行时：测点编号 -> (最小坐标, 最大坐标)
+    ranges: dict[str, tuple[int, int]] | None = None
+    # solve_reconcile 可行时：最小非负整数 e（逐点校正量绝对值的最大值）
+    max_abs_correction: int | None = None
+    # solve_redundancy 可行时：逐条约束（请求顺序）的推导界与冗余标记
+    redundancy: list[RedundancyItem] | None = None
+    # solve_relax 可行时：每条约束下界减 e、上界加 e 所需的最小非负整数 e
+    relaxation: int | None = None
+
+
+def _err(code: str, message: str, location: list, constraint_id: str | None = None) -> dict:
+    item: dict = {
+        "code": code,
+        "message": message,
+        "location": location,
+    }
+    if constraint_id is not None:
+        item["constraint_id"] = constraint_id
+    return item
+
+
+def validate_request(req: ChainRequest) -> None:
+    """执行与求解无关的静态校验，收集全部错误后一次性抛出。"""
+    errors: list[dict] = []
+
+    datum = req.datum_points
+    measure = req.measure_points
+
+    seen_d: dict[str, int] = {}
+    for i, p in enumerate(datum):
+        if p in seen_d:
+            errors.append(
+                _err(
+                    "duplicate_point",
+                    f"基准点 {p!r} 重复声明（首次出现于 datum_points[{seen_d[p]}]）",
+                    ["datum_points", i],
+                )
+            )
+        else:
+            seen_d[p] = i
+
+    seen_m: dict[str, int] = {}
+    for i, p in enumerate(measure):
+        if p in seen_m:
+            errors.append(
+                _err(
+                    "duplicate_point",
+                    f"测点 {p!r} 重复声明（首次出现于 measure_points[{seen_m[p]}]）",
+                    ["measure_points", i],
+                )
+            )
+        else:
+            seen_m[p] = i
+        if p in seen_d:
+            errors.append(
+                _err(
+                    "point_role_conflict",
+                    f"点 {p!r} 不能同时作为基准点和测点",
+                    ["measure_points", i],
+                )
+            )
+
+    declared = set(seen_d) | set(seen_m)
+
+    seen_c: dict[str, int] = {}
+    for i, c in enumerate(req.constraints):
+        if c.id in seen_c:
+            errors.append(
+                _err(
+                    "duplicate_constraint",
+                    f"约束编号 {c.id!r} 重复（首次出现于 constraints[{seen_c[c.id]}]）",
+                    ["constraints", i],
+                    c.id,
+                )
+            )
+        else:
+            seen_c[c.id] = i
+
+        if c.start not in declared:
+            errors.append(
+                _err(
+                    "unknown_point",
+                    f"约束 {c.id!r} 的起点 {c.start!r} 未在基准点或测点中声明",
+                    ["constraints", i, "start"],
+                    c.id,
+                )
+            )
+        if c.end not in declared:
+            errors.append(
+                _err(
+                    "unknown_point",
+                    f"约束 {c.id!r} 的终点 {c.end!r} 未在基准点或测点中声明",
+                    ["constraints", i, "end"],
+                    c.id,
+                )
+            )
+        if c.lower > c.upper:
+            errors.append(
+                _err(
+                    "reversed_interval",
+                    f"约束 {c.id!r} 的公差区间反向：lower={c.lower} > upper={c.upper}",
+                    ["constraints", i, "lower"],
+                    c.id,
+                )
+            )
+
+    # 无向连通性：每个测点必须经约束链连到至少一个基准点。
+    # 存在未知点时连通性结果不可靠，跳过（未知点错误已上报）。
+    if not any(e["code"] == "unknown_point" for e in errors):
+        adjacency: dict[str, set[str]] = {p: set() for p in declared}
+        for c in req.constraints:
+            adjacency[c.start].add(c.end)
+            adjacency[c.end].add(c.start)
+
+        reached: set[str] = set()
+        queue: deque[str] = deque(p for p in seen_d)
+        reached.update(seen_d)
+        while queue:
+            cur = queue.popleft()
+            for nxt in adjacency[cur]:
+                if nxt not in reached:
+                    reached.add(nxt)
+                    queue.append(nxt)
+
+        for i, p in enumerate(measure):
+            if p not in reached:
+                errors.append(
+                    _err(
+                        "point_not_connected_to_datum",
+                        f"测点 {p!r} 未通过任何约束链连接到基准点，无法确定其坐标",
+                        ["measure_points", i],
+                    )
+                )
+
+    if errors:
+        raise ValidationError(errors)
+
+
+def validate_readings(req: ReconcileRequest) -> None:
+    """校验 readings 恰好覆盖全部测点：不得缺漏，也不得含基准点/额外测点。
+
+    调用前 validate_request 已通过（故测点编号无重复、点角色不冲突）。
+    """
+    errors: list[dict] = []
+    reading_ids = set(req.readings)
+    datum = set(req.datum_points)
+    measure_set = set(req.measure_points)
+
+    for p in req.measure_points:
+        if p not in reading_ids:
+            errors.append(
+                _err(
+                    "reading_missing",
+                    f"测点 {p!r} 缺少 readings 读数（readings 必须恰好覆盖全部测点）",
+                    ["readings", p],
+                )
+            )
+
+    for p in req.readings:  # dict 顺序即请求顺序
+        if p in datum:
+            errors.append(
+                _err(
+                    "reading_extra",
+                    f"读数键 {p!r} 是基准点，readings 只能包含 measure_points 中声明的测点",
+                    ["readings", p],
+                )
+            )
+        elif p not in measure_set:
+            errors.append(
+                _err(
+                    "reading_extra",
+                    f"读数键 {p!r} 未在 measure_points 中声明（额外测点）",
+                    ["readings", p],
+                )
+            )
+
+    if errors:
+        raise ValidationError(errors)
+
+
+def _build_edges(req: ChainRequest, anchor: str, slack: int = 0) -> list[Edge]:
+    """构造差分图的全部边（顺序固定，保证结果确定性）。
+
+    ``slack`` 为统一放宽量 e：每条约束的上下界边权各加 e（区间放宽为
+    [lower−e, upper+e]），基准点 pin 边权恒为 0、不参与放宽。
+    """
+    edges: list[Edge] = []
+    # 其余基准点与 anchor 互相钉在同一坐标（同为 0），放宽不影响 pin 边
+    for d in req.datum_points:
+        if d == anchor:
+            continue
+        edges.append(Edge(anchor, d, 0, None, "datum_pin", None, None))
+        edges.append(Edge(d, anchor, 0, None, "datum_pin", None, None))
+    for c in req.constraints:
+        edges.extend(_constraint_edges(c, slack))
+    return edges
+
+
+def _constraint_edges(c: ConstraintIn, slack: int = 0) -> tuple[Edge, Edge]:
+    return (
+        Edge(c.start, c.end, c.upper + slack, c.id, "upper", c.start, c.end),
+        Edge(c.end, c.start, -c.lower + slack, c.id, "lower", c.start, c.end),
+    )
+
+
+def _bellman_ford(
+    nodes: list[str], edges: list[Edge], source: str
+) -> tuple[dict[str, int], dict[str, Edge], Edge | None]:
+    """从 source 跑 Bellman-Ford。
+
+    返回 (最短距离, 前驱边, 负环线索边)：第 |V| 轮仍可松弛时线索边非空，
+    配合前驱链可还原一个负环。
+    """
+    n = len(nodes)
+    dist: dict[str, int] = {p: INF for p in nodes}
+    dist[source] = 0
+    pred: dict[str, Edge] = {}
+
+    bad_edge: Edge | None = None
+    for iteration in range(n):
+        changed = False
+        for e in edges:
+            du = dist[e.fr]
+            if du == INF:
+                continue
+            nd = du + e.weight
+            if nd < dist[e.to]:
+                dist[e.to] = nd
+                pred[e.to] = e
+                changed = True
+                if iteration == n - 1:
+                    bad_edge = e
+        if not changed:
+            break
+    return dist, pred, bad_edge
+
+
+def _extract_cycle(pred: dict[str, Edge], bad_edge: Edge, n: int) -> list[Edge]:
+    """从第 n 轮仍被松弛的边沿前驱回退，还原一个有向负环。"""
+    x = bad_edge.to
+    for _ in range(n):
+        x = pred[x].fr
+
+    cycle: list[Edge] = []
+    cur = x
+    while True:
+        e = pred[cur]
+        cycle.append(e)
+        cur = e.fr
+        if cur == x:
+            break
+    cycle.reverse()  # 还原为沿有向环正向排列
+    return cycle
+
+
+def solve(req: ChainRequest) -> SolveResult:
+    """静态校验通过后做可行性判定。调用方应先调用 validate_request。"""
+    validate_request(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    edges = _build_edges(req, anchor)
+
+    dist, pred, bad_edge = _bellman_ford(nodes, edges, anchor)
+
+    if bad_edge is None:
+        # 可行：最短距离给出一组满足全部上界的坐标，基准点为 0
+        coordinates = {p: int(dist[p]) for p in nodes}
+        return SolveResult(True, coordinates, [], 0)
+
+    cycle = _extract_cycle(pred, bad_edge, len(nodes))
+    return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+
+def solve_ranges(req: ChainRequest) -> SolveResult:
+    """可行性校核 + 可行时返回各测点的全局紧界（最小/最大整数微米坐标）。
+
+    最大坐标取原图自 anchor 的最短距离；最小坐标取转置图自 anchor 的
+    最短距离再取负。两组极值坐标各自全局可行，故界是紧的，但一般不是
+    同一组坐标同时达到。
+    """
+    validate_request(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    edges = _build_edges(req, anchor)
+
+    upper_dist, pred, bad_edge = _bellman_ford(nodes, edges, anchor)
+    if bad_edge is not None:
+        cycle = _extract_cycle(pred, bad_edge, len(nodes))
+        return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+    # 转置图：边全部反向、权不变。静态校验保证无向连通，转置图中 anchor
+    # 同样可达所有点，距离均为有限值；原图无负环 ⇔ 转置图无负环。
+    rev_edges = [
+        Edge(e.to, e.fr, e.weight, e.cid, e.bound, e.start, e.end) for e in edges
+    ]
+    lower_dist, _, rev_bad = _bellman_ford(nodes, rev_edges, anchor)
+    if rev_bad is not None:  # pragma: no cover - 理论上不可达：负环与其转置同时存在
+        raise RuntimeError("转置图检测到负环，与原图可行性结论矛盾")
+
+    coordinates = {p: int(upper_dist[p]) for p in nodes}
+    ranges: dict[str, tuple[int, int]] = {}
+    for p in req.measure_points:
+        # -lower_dist[p] ≤ x_p ≤ upper_dist[p]
+        ranges[p] = (-int(lower_dist[p]), int(upper_dist[p]))
+    return SolveResult(True, coordinates, [], 0, ranges)
+
+
+def solve_redundancy(req: ChainRequest) -> SolveResult:
+    """逐条判定约束是否已被其余约束与基准点钉零关系蕴含。
+
+    先整体判可行：静态校验失败抛 ValidationError；不可行时返回与 solve
+    相同的矛盾闭环。可行时按请求顺序对每条约束
+    ``c: coord(end) − coord(start) ∈ [lower, upper]``，在删去 c 的上下界
+    两条差分边后的图上（其余约束、datum_pin 边全部保留）求最紧推导区间：
+
+    * 推导上界 = 删边图 start→end 的最短距离（不可达 ⇒ 上无界 ⇒ None）；
+    * 推导下界 = 删边图 end→start 的最短距离取负（不可达 ⇒ 下无界 ⇒ None）。
+
+    仅当两侧均有界且推导区间完全落入 [lower, upper] 时标记 redundant。
+    原图无负环 ⇒ 删边子图（少边）亦无负环，最短路必存在（或不可达）。
+
+    实现上先用队列松弛（SPFA，与 Bellman–Ford 同族的差分图最短路）从每个
+    节点求一次全图最短距离。对边 e: u→v 权 w：若全图 d(u,v) < w，则任何
+    最短 u→v 路径都不会取 e（simple path 上 e 只能作为整段 u→v 单条边出现），
+    删边距离就是 d(u,v)；只有 d(u,v) == w 的“紧边”才需要在删去该约束的
+    图上单独重算。一般只有少量边是紧边，从而把朴素的每约束两次 Bellman–Ford
+    （O(|C|·|V|·|E|)）压缩为全源最短路加少量删边最短路。
+    """
+    validate_request(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    edges = _build_edges(req, anchor)
+
+    # 沿用 Bellman–Ford 做可行性判定（与 /check 同一套负环溯源）
+    dist, pred, bad_edge = _bellman_ford(nodes, edges, anchor)
+    if bad_edge is not None:
+        cycle = _extract_cycle(pred, bad_edge, len(nodes))
+        return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+    # 可行图无负环：全源最短路（含负权，SPFA 必然收敛）。
+    # 每条约束上下界成对出边、基准 pin 边双向，故全图强连通、距离均有限；
+    # 删边后不可达的节点距离在删边重算时才出现。
+    adjacency: dict[str, list[Edge]] = {p: [] for p in nodes}
+    for e in edges:
+        adjacency[e.fr].append(e)
+    full_dist = {p: _spfa(nodes, adjacency, p) for p in nodes}
+
+    items: list[RedundancyItem] = []
+    for c in req.constraints:
+        # 上界：删去待判约束自身后 start→end 的最短路（pin 边 cid=None 保留）
+        if full_dist[c.start][c.end] < c.upper:
+            upper = int(full_dist[c.start][c.end])  # 松边：删不删都一样
+        else:
+            d_red = _spfa(nodes, adjacency, c.start, exclude_cid=c.id)
+            upper = int(d_red[c.end]) if d_red[c.end] != INF else None
+        # 下界：删边图 end→start 最短路取负
+        if full_dist[c.end][c.start] < -c.lower:
+            lower = -int(full_dist[c.end][c.start])
+        else:
+            d_red = _spfa(nodes, adjacency, c.end, exclude_cid=c.id)
+            lower = -int(d_red[c.start]) if d_red[c.start] != INF else None
+        items.append(
+            RedundancyItem(
+                cid=c.id,
+                lower=lower,
+                upper=upper,
+                redundant=(
+                    lower is not None
+                    and upper is not None
+                    and lower >= c.lower
+                    and upper <= c.upper
+                ),
+            )
+        )
+
+    coordinates = {p: int(dist[p]) for p in nodes}
+    return SolveResult(True, coordinates, [], 0, redundancy=items)
+
+
+def _spfa(
+    nodes: list[str],
+    adjacency: dict[str, list[Edge]],
+    source: str,
+    exclude_cid: str | None = None,
+) -> dict[str, int]:
+    """从 source 在差分图上求最短路（队列松弛 / SPFA）。
+
+    与 ``_bellman_ford`` 同为 Bellman–Ford 族松弛，只是只松弛上一轮真正
+    变短的节点，在可行（无负环）图上必然收敛且通常快得多。
+    ``exclude_cid`` 非空时跳过该编号约束的两条边（datum_pin 边 cid=None
+    永不被跳过），用于冗余判定的删边最短路。
+    """
+    dist: dict[str, int] = {p: INF for p in nodes}
+    dist[source] = 0
+    in_queue: dict[str, bool] = {p: False for p in nodes}
+    queue: deque[str] = deque([source])
+    in_queue[source] = True
+    while queue:
+        cur = queue.popleft()
+        in_queue[cur] = False
+        base = dist[cur]
+        for e in adjacency[cur]:
+            if exclude_cid is not None and e.cid == exclude_cid:
+                continue
+            nd = base + e.weight
+            if nd < dist[e.to]:
+                dist[e.to] = nd
+                if not in_queue[e.to]:
+                    in_queue[e.to] = True
+                    queue.append(e.to)
+    return dist
+
+
+def solve_reconcile(req: ReconcileRequest) -> SolveResult:
+    """读数校正：求使全部测点同时满足 |校正坐标 − 读数| ≤ e 的最小非负整数 e。
+
+    先按原尺寸约束判可行：无解则返回与 solve 相同的矛盾闭环。有解时把读数
+    区间并入差分图，利用可行性对 e 的单调性二分求全局最小 e*，并返回 e* 图上
+    达到该值的同一组可行校正坐标（基准点为 0）。
+
+    读数边均以 anchor 为端点，故并入后的负环只有三类（路径中间不经过 anchor，
+    经过 anchor 的走法可拆成前两类简单环）：
+
+    * anchor →(原图最短路 f(v))→ v →(读数边 e−r_v)→ anchor；
+    * anchor →(读数边 r_v+e)→ v →(原图最短路 g(v)=v→anchor)→ anchor；
+    * anchor →(r_p+e)→ p →(去掉 anchor 的子图最短路 δ(p→q))→ q
+      →(e−r_q)→ anchor，其中 min_p(r_p+δ(p→q)) 记为 h(q)。
+
+    f/g/h 都与 e 无关，各跑一次 Bellman–Ford 预计算后，每个 e 的可行性
+    判定只需 O(|V|) 次比较，二分成本可忽略。最终坐标取并入图的最短路距离
+    d*(v) = min(f(v), h(v)+e*)（h(v) 经读数边给出 anchor 出发的新路径）。
+    """
+    validate_request(req)
+    validate_readings(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    measure = req.measure_points
+    base_edges = _build_edges(req, anchor)
+
+    # 阶段一：原尺寸约束本身必须有解；无解时沿用现有矛盾闭环。
+    # f(v)：原图 anchor→v 最短距离（兼作可行性判定）。
+    f_dist, pred, bad_edge = _bellman_ford(nodes, base_edges, anchor)
+    if bad_edge is not None:
+        cycle = _extract_cycle(pred, bad_edge, len(nodes))
+        return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+    # g(v)：原图 v→anchor 最短距离 = 转置图 anchor→v 最短距离。
+    rev_edges = [
+        Edge(e.to, e.fr, e.weight, e.cid, e.bound, e.start, e.end) for e in base_edges
+    ]
+    rev_dist, _, rev_bad = _bellman_ford(nodes, rev_edges, anchor)
+    if rev_bad is not None:  # pragma: no cover - 原图无负环 ⇔ 转置图无负环
+        raise RuntimeError("转置图检测到负环，与原图可行性结论矛盾")
+
+    # h(v)：去掉 anchor 的子图中 min_p(r_p + δ(p→v))。以超源点初始化
+    # （测点初值 r_p、其余 INF）跑 Bellman–Ford；子图无负环（原图已可行）。
+    inner_nodes = [p for p in nodes if p != anchor]
+    inner_edges = [
+        e for e in base_edges if e.fr != anchor and e.to != anchor
+    ]
+    readings: dict[str, int] = {p: req.readings[p] for p in measure}
+    h_dist = {p: readings.get(p, INF) for p in inner_nodes}
+    h_dist = _bellman_ford_distances(inner_nodes, inner_edges, h_dist)
+
+    def feasible_at(e: int) -> bool:
+        """并入读数区间（半宽 e）后的差分图是否存在负环。"""
+        for p in measure:
+            # 单侧读数环：f(p)+e-r_p<0；r_p+e+g(p)<0
+            if int(f_dist[p]) + e - readings[p] < 0:
+                return False
+            if readings[p] + e + int(rev_dist[p]) < 0:
+                return False
+            # 双侧读数环：2e + h(p) − r_p < 0
+            if 2 * e + int(h_dist[p]) - readings[p] < 0:
+                return False
+        return True
+
+    # 可行性对 e 单调（区间只扩不缩）。f 本身是一组可行坐标，
+    # 其到读数的最大偏差给出保证可行的有限上界。
+    hi = max(abs(int(f_dist[p]) - readings[p]) for p in measure)
+    lo = -1  # 约定 lo 侧“不可行”；e 从 0 起
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if feasible_at(mid):
+            hi = mid
+        else:
+            lo = mid
+    e_star = hi
+
+    # e* 并入图的最短距离：原图路径 f(v) 或“读数边 + 子图最短路” h(v)+e*
+    coordinates: dict[str, int] = {anchor: 0}
+    for v in inner_nodes:
+        via_reading = h_dist[v] + e_star if h_dist[v] != INF else INF
+        coordinates[v] = int(min(f_dist[v], via_reading))
+    return SolveResult(True, coordinates, [], 0, None, e_star)
+
+
+def _bellman_ford_distances(
+    nodes: list[str], edges: list[Edge], initial: dict[str, int]
+) -> dict[str, int]:
+    """从给定初始距离（等价于超源点边）跑 Bellman–Ford，只返回最短距离。
+
+    用于 reconcile 的子图最短路：原图已被证明无负环，子图不可能出现负环。
+    """
+    dist = dict(initial)
+    for _ in range(len(nodes)):
+        changed = False
+        for e in edges:
+            du = dist[e.fr]
+            if du == INF:
+                continue
+            nd = du + e.weight
+            if nd < dist[e.to]:
+                dist[e.to] = nd
+                changed = True
+        if not changed:
+            break
+    return dist
+
+
+def _slack_shortest_paths(
+    nodes: list[str],
+    adjacency: dict[str, list[Edge]],
+    source: str,
+    n: int,
+) -> tuple[dict[str, int], bool]:
+    """从 source 跑 SPFA，返回 (最短距离, 是否检测到可达负环)。
+
+    用于统一放宽判定：用“源点到各点当前最短路径上的边数”做负环检测——
+    一次松弛使该边数 ≥ n（n 为节点数）时，最短路径不可能是简单路径，
+    必含负环。静态校验保证无向连通且基准 pin 边双向，图（任意放宽量下）
+    从 anchor 强可达所有节点，故该检测覆盖图中全部负环，而不是仅一个：
+    存在任何负环时，环上节点的最短距离会沿环无限下降，FIFO 队列松弛
+    必然在有限步内触发计数判据。
+    """
+    dist: dict[str, int] = {p: INF for p in nodes}
+    dist[source] = 0
+    steps: dict[str, int] = {p: 0 for p in nodes}
+    in_queue: dict[str, bool] = {p: False for p in nodes}
+    queue: deque[str] = deque([source])
+    in_queue[source] = True
+    has_negative_cycle = False
+    while queue:
+        cur = queue.popleft()
+        in_queue[cur] = False
+        base = dist[cur]
+        for e in adjacency[cur]:
+            nd = base + e.weight
+            if nd < dist[e.to]:
+                dist[e.to] = nd
+                steps[e.to] = steps[cur] + 1
+                if steps[e.to] >= n:
+                    has_negative_cycle = True
+                    continue
+                if not in_queue[e.to]:
+                    in_queue[e.to] = True
+                    queue.append(e.to)
+    return dist, has_negative_cycle
+
+
+def solve_relax(req: ChainRequest) -> SolveResult:
+    """统一放宽：求使全部约束同时可行的最小非负整数 e。
+
+    每条约束放宽为 ``coord(end) − coord(start) ∈ [lower−e, upper+e]``
+    （基准点仍固定为 0，pin 边不放宽）。含 k 条约束边的任意闭环 C 的环权为
+    ``W(C) + k·e``，故 e* = ``max_C ⌈−W(C)/k⌉``，必须覆盖图中所有冲突环。
+    可行性对 e 单调，用 SPFA 全局负环检测二分最小 e；二分上界取使所有
+    约束边权非负的最小 e（``hi = max(0, −min 约束边权)``），此时连同
+    0 权 pin 边的全图不存在负环。返回 e* 及同一组满足放宽后全部约束的
+    整数坐标；原请求可行时 e=0。
+    """
+    validate_request(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    n = len(nodes)
+
+    def feasible_at(e: int) -> tuple[bool, dict[str, int]]:
+        edges = _build_edges(req, anchor, slack=e)
+        adjacency: dict[str, list[Edge]] = {p: [] for p in nodes}
+        for ed in edges:
+            adjacency[ed.fr].append(ed)
+        dist, has_neg_cycle = _slack_shortest_paths(nodes, adjacency, anchor, n)
+        return not has_neg_cycle, dist
+
+    ok, dist = feasible_at(0)
+    if ok:
+        coordinates = {p: int(dist[p]) for p in nodes}
+        return SolveResult(True, coordinates, [], 0, relaxation=0)
+
+    # 有限上界：e ≥ −min 约束边权 时所有约束边权非负，全图无负环。
+    min_weight = min(
+        w
+        for c in req.constraints
+        for w in (c.upper, -c.lower)
+    )
+    hi = max(0, -min_weight)
+    lo = -1  # 约定 lo 侧“不可行”
+    coordinates_dist: dict[str, int] | None = None
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        mid_ok, mid_dist = feasible_at(mid)
+        if mid_ok:
+            hi = mid
+            coordinates_dist = mid_dist
+        else:
+            lo = mid
+
+    e_star = hi
+    # 二分过程中最后一个判为可行的中点距离可直接复用；若最小可行 e 从未被
+    # 二分评估到（如 hi=1、e*=0 已在前面提前返回，故此处只需补 e*=hi 且
+    # 没有可行中点记录的情形），在 e* 上补跑一次以取得同一组可行坐标。
+    if coordinates_dist is None:
+        feasible, coordinates_dist = feasible_at(e_star)
+        assert feasible  # hi 由构造保证可行
+    coordinates = {p: int(coordinates_dist[p]) for p in nodes}
+    return SolveResult(True, coordinates, [], 0, relaxation=e_star)
