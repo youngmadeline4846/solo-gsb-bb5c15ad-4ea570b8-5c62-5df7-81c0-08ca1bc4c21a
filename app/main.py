@@ -22,6 +22,8 @@ from .schemas import (
     RedundancyResponse,
     RelaxResponse,
     RelaxedConstraint,
+    ShimsRequest,
+    ShimsResponse,
     ValidationErrorResponse,
 )
 from .solver import (
@@ -33,6 +35,7 @@ from .solver import (
     solve_reconcile,
     solve_redundancy,
     solve_relax,
+    solve_shims,
 )
 
 logger = logging.getLogger("dimchain")
@@ -44,7 +47,10 @@ app = FastAPI(
         "服务端将界限转为差分约束并判定公差能否同时成立；可行时返回以基准点为零"
         "的各点坐标，不可行时返回构成矛盾闭环的原始约束编号。/relax 则在矛盾时"
         "把每条约束统一放宽为 [lower−e, upper+e]（基准点固定为 0），求覆盖全部"
-        "冲突环的最小非负整数 e 及同一组放宽后的可行整数坐标。"
+        "冲突环的最小非负整数 e 及同一组放宽后的可行整数坐标。/shims 在可行"
+        "时求指定起止点间“终点坐标−起点坐标”的可达整数紧区间，从给定标准"
+        "厚度中选出与目标厚度最接近（平手取较薄）的一项，并返回达到所选厚度"
+        "与全部原约束的同一组整数坐标。"
     ),
     version=__version__,
 )
@@ -224,6 +230,31 @@ def relax_chain(req: ChainRequest):
         relaxation=e,
         coordinates=result.coordinates,
         constraints=items,
+    )
+
+
+@app.post(
+    "/api/v1/chains/shims",
+    response_model=ShimsResponse | InfeasibleResponse,
+    summary="按可达间隙紧区间选配标准垫片厚度",
+    responses={422: {"model": ValidationErrorResponse}},
+    tags=["chains"],
+)
+def shims_chain(req: ShimsRequest):
+    result = solve_shims(req)
+    if not result.feasible:
+        return _build_infeasible(result)
+
+    lower, upper = result.shim_range  # type: ignore[misc]
+    return ShimsResponse(
+        start=req.start,
+        end=req.end,
+        minimum=lower,
+        maximum=upper,
+        target_thickness=req.target_thickness,
+        candidates=result.shim_candidates or [],
+        selected_thickness=result.selected_thickness,
+        coordinates=result.coordinates if result.selected_thickness is not None else None,
     )
 
 

@@ -87,6 +87,21 @@ Bellman–Ford 一次只还原一个负环，仅按首个矛盾闭环估 e 会�
 （pin 边本就为 0）时图中必无负环，给出有限二分上界
 ``hi = max(0, −min 约束边权)``。e* 下从 anchor 的最短距离即一组满足放宽后
 全部约束的整数坐标（基准点为 0）；原系统可行时 e=0，坐标与 ``solve`` 一致。
+
+垫片选配（``solve_shims``）
+---------------------------
+在可行差分图上考察间隙变量 ``g = coord(end) − coord(start)`` 的可达范围：
+沿任意 start→end 路径累加有 ``g ≤ 路径权和``，故最大可达间隙
+``U = d(start,end)``（原图最短路）；同理最小可达间隙
+``L = −d(end,start)``。可达值恰为整个整数闭区间 ``[L, U]``——对任意
+``t ∈ [L, U]`` 追加“定隙边” start→end 权 t、end→start 权 −t（即
+``g = t``）后图中仍无负环：任何含 start→end 定隙边的有向闭环都可写成
+该边加一条 end→start 原路径，环权 ≥ ``t − d(start,end) = t − U ≥ 0``；
+含反向定隙边的环同理 ≥ ``−t − d(end,start) = L − t ≥ 0``。整数权保证
+端点与全部中间值都是整数微米可达。从标准厚度中筛出落入 ``[L, U]`` 的
+规格（去重升序），按 ``|t − target|`` 最小、平手取较薄者选出唯一一项；
+无规格落入区间时选配结果为 None。选中 t 后在追加定隙边的图上从 anchor
+跑 Bellman–Ford，其最短距离即满足全部原约束且间隙恰为 t 的同一组整数坐标。
 """
 
 from __future__ import annotations
@@ -94,7 +109,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 
-from .schemas import ChainRequest, ConstraintIn, ReconcileRequest
+from .schemas import ChainRequest, ConstraintIn, ReconcileRequest, ShimsRequest
 
 INF: int = 10**30
 
@@ -143,6 +158,12 @@ class SolveResult:
     redundancy: list[RedundancyItem] | None = None
     # solve_relax 可行时：每条约束下界减 e、上界加 e 所需的最小非负整数 e
     relaxation: int | None = None
+    # solve_shims 可行时：coord(end)−coord(start) 的可达整数紧区间 (最小, 最大)
+    shim_range: tuple[int, int] | None = None
+    # solve_shims 可行时：落入可达区间的标准厚度（去重升序）
+    shim_candidates: list[int] | None = None
+    # solve_shims 可行时：按 |t−target| 最小、再厚度较小选出的厚度（无规格为 None）
+    selected_thickness: int | None = None
 
 
 def _err(code: str, message: str, location: list, constraint_id: str | None = None) -> dict:
@@ -311,6 +332,27 @@ def validate_readings(req: ReconcileRequest) -> None:
                 )
             )
 
+    if errors:
+        raise ValidationError(errors)
+
+
+def validate_shim_points(req: ShimsRequest) -> None:
+    """校验垫片间隙的起止点都已在基准点/测点中声明。
+
+    调用前 validate_request 已通过（故点编号无重复、角色不冲突）。
+    """
+    errors: list[dict] = []
+    declared = set(req.datum_points) | set(req.measure_points)
+    for field in ("start", "end"):
+        p = getattr(req, field)
+        if p not in declared:
+            errors.append(
+                _err(
+                    "unknown_point",
+                    f"垫片{('起点' if field == 'start' else '终点')} {p!r} 未在基准点或测点中声明",
+                    [field],
+                )
+            )
     if errors:
         raise ValidationError(errors)
 
@@ -756,3 +798,86 @@ def solve_relax(req: ChainRequest) -> SolveResult:
         assert feasible  # hi 由构造保证可行
     coordinates = {p: int(coordinates_dist[p]) for p in nodes}
     return SolveResult(True, coordinates, [], 0, relaxation=e_star)
+
+
+def solve_shims(req: ShimsRequest) -> SolveResult:
+    """垫片选配：求 coord(end)−coord(start) 的可达整数紧区间并在区间内选规格。
+
+    先按原尺寸约束判可行：静态校验失败抛 ValidationError；无解时返回与 solve
+    相同的矛盾闭环。可行时在原差分图上用最短路刻画可达间隙：
+
+    * 最大可达间隙 = start→end 的最短距离 d(start,end)（沿任意路径都有
+      x_end − x_start ≤ 路径权和，最短者为最紧上界，且最短距离赋值达到它）；
+    * 最小可达间隙 = −d(end,start)（同理，end→start 最短距离取负）。
+
+    可达间隙恰为整个整数闭区间 [L, U]（L = −d(end,start)，U = d(start,end)）：
+    对任意 t ∈ [L, U]，追加两条权 t 的“定隙边” start→end 与 end→start（即
+    x_end − x_start = t）后图中仍无负环——任意含定隙边的有向闭环权不小于
+    t − d(start,end) ≥ 0 或 −t − d(end,start) ≥ 0，故 t 必由某组整数坐标达到。
+
+    随后把标准厚度列表去重后筛出落入 [L, U] 的规格（升序），按
+    ``|t − target_thickness|`` 最小、绝对差相同取厚度较小者选出唯一一项；
+    无规格落入区间时所选项与坐标均为 None。有所选厚度 t 时，在原图上追加
+    上述两条定隙边再从 anchor 跑 Bellman–Ford，其最短距离即满足全部原约束
+    且 x_end − x_start 恰为 t 的同一组整数坐标（基准点为 0）。
+    """
+    validate_request(req)
+    validate_shim_points(req)
+
+    anchor = req.datum_points[0]
+    nodes = list(dict.fromkeys([*req.datum_points, *req.measure_points]))
+    edges = _build_edges(req, anchor)
+
+    # 沿用 /check 的 Bellman-Ford 可行性判定与矛盾闭环溯源
+    dist, pred, bad_edge = _bellman_ford(nodes, edges, anchor)
+    if bad_edge is not None:
+        cycle = _extract_cycle(pred, bad_edge, len(nodes))
+        return SolveResult(False, {}, cycle, sum(e.weight for e in cycle))
+
+    # 可行图（含基准 pin 双向边、每条约束两条边）强连通，SPFA 距离均有限。
+    adjacency: dict[str, list[Edge]] = {p: [] for p in nodes}
+    for e in edges:
+        adjacency[e.fr].append(e)
+    d_forward = _spfa(nodes, adjacency, req.start)
+    d_backward = _spfa(nodes, adjacency, req.end)
+    upper = int(d_forward[req.end])  # max coord(end) − coord(start)
+    lower = -int(d_backward[req.start])  # min coord(end) − coord(start)
+
+    candidates = sorted(
+        {t for t in req.standard_thicknesses if lower <= t <= upper}
+    )
+
+    if not candidates:
+        return SolveResult(
+            True,
+            {},
+            [],
+            0,
+            shim_range=(lower, upper),
+            shim_candidates=[],
+            selected_thickness=None,
+        )
+
+    target = req.target_thickness
+    selected = min(candidates, key=lambda t: (abs(t - target), t))
+
+    # 追加定隙边 x_end − x_start = selected：
+    # start→end 权 selected（上界），end→start 权 −selected（下界反向）。
+    # selected ∈ [lower, upper] 保证追加后无负环（见函数 docstring）。
+    gap_edges = edges + [
+        Edge(req.start, req.end, selected, None, "shim_pin", req.start, req.end),
+        Edge(req.end, req.start, -selected, None, "shim_pin", req.start, req.end),
+    ]
+    gap_dist, _, gap_bad = _bellman_ford(nodes, gap_edges, anchor)
+    if gap_bad is not None:  # pragma: no cover - 由紧区间构造保证不可达
+        raise RuntimeError("定隙边触发负环：所选厚度不在可达紧区间内")
+    coordinates = {p: int(gap_dist[p]) for p in nodes}
+    return SolveResult(
+        True,
+        coordinates,
+        [],
+        0,
+        shim_range=(lower, upper),
+        shim_candidates=candidates,
+        selected_thickness=selected,
+    )
